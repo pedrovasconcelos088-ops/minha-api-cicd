@@ -1,0 +1,176 @@
+name: CI/CD - FastAPI
+
+on:
+  push:
+    branches:
+      - develop
+      - main
+
+env:
+  IMAGE_NAME: fastapi-app
+  CONTAINER_NAME: fastapi-app
+  APP_PORT: "8080"
+  PYTHON_VERSION: "3.12"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Testes
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Instalar dependências
+        run: pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Rodar testes
+        run: python -m pytest -v
+
+  # ---------------- HOMOLOGAÇÃO (branch develop) ----------------
+  build-homol:
+    name: "HOMOL - Build & Push"
+    if: github.ref == 'refs/heads/develop'
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login no Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build e push da imagem
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:homol-${{ github.sha }}
+            ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:homol
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy-homol:
+    name: "HOMOL - Deploy via SSH"
+    if: github.ref == 'refs/heads/develop'
+    needs: build-homol
+    runs-on: ubuntu-latest
+    environment: homolog
+    concurrency:
+      group: deploy-homol
+      cancel-in-progress: false
+    steps:
+      - name: Deploy na EC2 de homologação
+        uses: appleboy/ssh-action@v1.2.0
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          IMAGE_REF: ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:homol-${{ github.sha }}
+          CONTAINER_NAME: ${{ env.CONTAINER_NAME }}
+          APP_PORT: ${{ env.APP_PORT }}
+          APP_ENV: homolog
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USERNAME }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          envs: DOCKERHUB_USERNAME,DOCKERHUB_TOKEN,IMAGE_REF,CONTAINER_NAME,APP_PORT,APP_ENV
+          script_stop: true
+          script: |
+            echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
+            docker pull "$IMAGE_REF"
+            docker stop "$CONTAINER_NAME" 2>/dev/null || true
+            docker rm "$CONTAINER_NAME" 2>/dev/null || true
+            docker run -d \
+              --name "$CONTAINER_NAME" \
+              --restart unless-stopped \
+              -p "$APP_PORT:8080" \
+              -e APP_ENV="$APP_ENV" \
+              "$IMAGE_REF"
+            if ! curl -fsS --retry 10 --retry-delay 3 --retry-connrefused "http://localhost:$APP_PORT/health"; then
+              docker logs "$CONTAINER_NAME"
+              exit 1
+            fi
+            docker image prune -f
+            docker logout
+
+  # ---------------- PRODUÇÃO (branch main) ----------------
+  build-prd:
+    name: "PRD - Build & Push"
+    if: github.ref == 'refs/heads/main'
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login no Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build e push da imagem
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+            ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy-prd:
+    name: "PRD - Deploy via SSH (requer aprovação)"
+    if: github.ref == 'refs/heads/main'
+    needs: build-prd
+    runs-on: ubuntu-latest
+    environment: production
+    concurrency:
+      group: deploy-prd
+      cancel-in-progress: false
+    steps:
+      - name: Deploy na EC2 de produção
+        uses: appleboy/ssh-action@v1.2.0
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          IMAGE_REF: ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          CONTAINER_NAME: ${{ env.CONTAINER_NAME }}
+          APP_PORT: ${{ env.APP_PORT }}
+          APP_ENV: production
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USERNAME }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          envs: DOCKERHUB_USERNAME,DOCKERHUB_TOKEN,IMAGE_REF,CONTAINER_NAME,APP_PORT,APP_ENV
+          script_stop: true
+          script: |
+            echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
+            docker pull "$IMAGE_REF"
+            docker stop "$CONTAINER_NAME" 2>/dev/null || true
+            docker rm "$CONTAINER_NAME" 2>/dev/null || true
+            docker run -d \
+              --name "$CONTAINER_NAME" \
+              --restart unless-stopped \
+              -p "$APP_PORT:8080" \
+              -e APP_ENV="$APP_ENV" \
+              "$IMAGE_REF"
+            if ! curl -fsS --retry 10 --retry-delay 3 --retry-connrefused "http://localhost:$APP_PORT/health"; then
+              docker logs "$CONTAINER_NAME"
+              exit 1
+            fi
+            docker image prune -f
+            docker logout
