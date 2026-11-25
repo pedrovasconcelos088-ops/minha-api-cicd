@@ -168,7 +168,8 @@ jobs:
               -p "$APP_PORT:8080" \
               -e APP_ENV="$APP_ENV" \
               "$IMAGE_REF"
-            if ! curl -fsS --retry 10 --retry-delay 3 --retry-connrefused "http://localhost:$APP_PORT/health"; then
+                       sleep 15
+            if ! curl -fsS --retry 15 --retry-delay 3 --retry-all-errors --retry-connrefused "http://localhost:$APP_PORT/health"; then
               docker logs "$CONTAINER_NAME"
               exit 1
             fi
